@@ -685,6 +685,69 @@ export function presetFromProject(dir: string, name: string): Preset | null {
   };
 }
 
+/* --------------------------------- устаревшее ----------------------------- */
+
+export interface OutdatedPkg {
+  name: string;
+  current: string;
+  wanted: string;
+  latest: string;
+  /** Зависимость или devDependency. */
+  dev: boolean;
+  /** Есть ли пакет в каталоге магазина. */
+  known: boolean;
+}
+
+export interface OutdatedResult {
+  ok: boolean;
+  manager: Manager;
+  items: OutdatedPkg[];
+  error?: string;
+}
+
+/**
+ * Что устарело в проекте: спрашиваем у пакетного менеджера.
+ * npm и pnpm умеют `outdated --json`, остальным честно говорим «не умею».
+ */
+export async function outdatedPackages(dir: string, manager?: Manager): Promise<OutdatedResult> {
+  seedCatalog();
+  const chosen = manager ?? detectManager(dir);
+  if (chosen === 'yarn' || chosen === 'bun') {
+    return { ok: false, manager: chosen, items: [], error: `${chosen} не умеет outdated --json — запусти ${chosen} outdated руками` };
+  }
+
+  const res = await runLine(`${chosen} outdated --json`, { cwd: dir, timeout: 120000 });
+  const raw = res.stdout.trim();
+  if (!raw) {
+    return res.ok
+      ? { ok: true, manager: chosen, items: [] }
+      : { ok: false, manager: chosen, items: [], error: (res.stderr || 'пакетный менеджер ничего не ответил').split(/\r?\n/)[0] };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, manager: chosen, items: [], error: 'не удалось разобрать ответ пакетного менеджера' };
+  }
+
+  const installed = installedMap(dir);
+  const toItem = (name: string, value: Record<string, unknown>): OutdatedPkg => ({
+    name,
+    current: String(value.current ?? '—'),
+    wanted: String(value.wanted ?? '—'),
+    latest: String(value.latest ?? '—'),
+    dev: installed.get(name)?.dev ?? false,
+    known: Boolean(getPkg(name)),
+  });
+
+  const items: OutdatedPkg[] = Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>[]).map((row) => toItem(String(row.name ?? '?'), row))
+    : Object.entries(parsed as Record<string, Record<string, unknown>>).map(([name, value]) => toItem(name, value ?? {}));
+
+  return { ok: true, manager: chosen, items: items.sort((a, b) => a.name.localeCompare(b.name)) };
+}
+
 /* ---------------------------------- .env ---------------------------------- */
 
 function readEnvNames(file: string): string[] {

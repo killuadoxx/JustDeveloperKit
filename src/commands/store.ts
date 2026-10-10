@@ -18,6 +18,7 @@ import {
   installText,
   installToProject,
   listPkgs,
+  outdatedPackages,
   parseInstallCommand,
   readProjectPackage,
   removePkg,
@@ -473,7 +474,7 @@ function printHistory(): void {
 
 /* --------------------------------- команда -------------------------------- */
 
-const SUBCOMMANDS = new Set(['list', 'ls', 'show', 'install', 'add', 'new', 'edit', 'remove', 'rm', 'restore', 'search', 'find', 'installed', 'history', 'log', 'help']);
+const SUBCOMMANDS = new Set(['list', 'ls', 'show', 'install', 'add', 'new', 'edit', 'remove', 'rm', 'restore', 'search', 'find', 'installed', 'history', 'log', 'outdated', 'updates', 'help']);
 
 export default {
   name: 'store',
@@ -481,13 +482,14 @@ export default {
   group: 'Магазин',
   title: 'Магазин расширений',
   desc: 'Каталог пакетов, установка в проект и свои записи',
-  usage: 'jd store [list|show|add|install|remove|restore|installed|history] [аргументы]',
+  usage: 'jd store [list|show|add|install|remove|restore|installed|history|outdated] [аргументы]',
   examples: [
     'jd store',
     'jd store list --category="Telegram и боты"',
     'jd store add "npm install grammy"',
     'jd store install grammy zod --dev',
     'jd store installed',
+    'jd store outdated',
   ],
 
   async run({ argv }) {
@@ -702,6 +704,49 @@ export default {
       case 'log':
         printHistory();
         return;
+
+      case 'outdated':
+      case 'updates': {
+        const spin = neonSpinner('спрашиваю у пакетного менеджера, что устарело…');
+        const result = await outdatedPackages(process.cwd(), (flagStr(args, 'manager', '') as Manager) || undefined);
+        spin.stop();
+
+        if (!result.ok && !result.items.length) {
+          fail(result.error ?? 'не получилось проверить версии.', 'Проверь вручную: npm outdated');
+          return;
+        }
+        if (flagBool(args, 'json')) {
+          process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+          return;
+        }
+        if (!result.items.length) {
+          process.stdout.write('\n');
+          ok('Всё актуально: обновлять нечего.');
+          process.stdout.write(paint('  проверить всю пачку: jd store outdated --json\n\n', fg(C.faint)));
+          return;
+        }
+        process.stdout.write(
+          '\n' +
+            table(
+              ['ПАКЕТ', 'СЕЙЧАС', 'ХОЧЕТ', 'ПОСЛЕДНЯЯ', 'ТИП', 'В МАГАЗИНЕ'],
+              result.items.map((item) => [
+                paint(item.name, bold(), fg(C.text)),
+                paint(item.current, fg(C.muted)),
+                paint(item.wanted, fg(C.soft)),
+                paint(item.latest, bold(), fg(C.warn)),
+                paint(item.dev ? 'dev' : 'deps', fg(C.faint)),
+                item.known ? paint('★', fg(C.accent)) : paint('·', fg(C.faint)),
+              ]),
+            ) +
+            '\n',
+        );
+        process.stdout.write(
+          paint(`  устарело: ${result.items.length}`, fg(C.warn)) +
+            paint(`   обновить один: jd store install ${result.items[0].name}@latest`, fg(C.faint)) +
+            paint(`\n  обновить всё: ${result.manager} update\n\n`, fg(C.faint)),
+        );
+        return;
+      }
 
       default: {
         if (!isInteractive()) {

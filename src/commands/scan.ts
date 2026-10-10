@@ -3,18 +3,24 @@
 // По умолчанию проверяется список популярных портов (быстро и читаемо),
 // полный диапазон — через --range=3000-9000.
 
-import { flagBool, flagList, flagStr, parseArgs } from '../core/args.ts';
+import { flagBool, flagList, flagNum, flagStr, parseArgs } from '../core/args.ts';
 import { fail } from '../core/help.ts';
 import { confirm, isInteractive, selectList } from '../core/input.ts';
 import { ch, N, neonSpinner } from '../core/neon.ts';
 import { killPid, parsePortSpec, POPULAR_PORTS, probePort, scanPorts, shortProcess, type ScanHit } from '../core/ports.ts';
 import { loadProject, ME_FILE } from '../core/project.ts';
 import { C, bold, fg, paint } from '../core/theme.ts';
-import { table } from '../core/ui.ts';
+import { clearScreen, table } from '../core/ui.ts';
+import { sleep } from '../core/util.ts';
 import type { Command } from '../core/registry.ts';
 
 const GREEN = C.ok;
 const RED = C.err;
+
+/** Отметка времени для журнала изменений в режиме наблюдения. */
+function clockNow(): string {
+  return new Date().toLocaleTimeString('ru-RU');
+}
 
 function statusCell(hit: ScanHit): string {
   if (!hit.open) return paint('● свободен', fg(GREEN));
@@ -81,8 +87,8 @@ export default {
 
     const args = parseArgs(
       argv,
-      { ports: 'array', p: 'array', range: 'string', r: 'string', all: 'boolean', a: 'boolean', busy: 'boolean', b: 'boolean', yes: 'boolean', y: 'boolean', project: 'boolean', json: 'boolean' },
-      { p: 'ports', r: 'range', a: 'all', b: 'busy', y: 'yes' },
+      { ports: 'array', p: 'array', range: 'string', r: 'string', all: 'boolean', a: 'boolean', busy: 'boolean', b: 'boolean', yes: 'boolean', y: 'boolean', project: 'boolean', json: 'boolean', watch: 'boolean', w: 'boolean', interval: 'number' },
+      { p: 'ports', r: 'range', a: 'all', b: 'busy', y: 'yes', w: 'watch' },
     );
 
     // Что сканируем: порты проекта, список, диапазон или набор по умолчанию.
@@ -167,6 +173,69 @@ export default {
         ) + '\n',
       );
       return;
+    }
+
+    // Слежение: пересканировать и сообщать, что занялось, а что освободилось.
+    if (flagBool(args, 'watch')) {
+      const intervalSec = Math.max(1, flagNum(args, 'interval', 3));
+      let previous = new Set(busy.map((h) => h.port));
+      let first = true;
+      const startedAt = new Date();
+
+      process.once('SIGINT', () => {
+        process.stdout.write(paint('\n  наблюдение остановлено\n\n', fg(C.muted)));
+        process.exit(0);
+      });
+
+      for (;;) {
+        const current = await scanPorts(ports);
+        const currentBusy = current.filter((h) => h.open);
+        const now = new Set(currentBusy.map((h) => h.port));
+        const appeared = [...now].filter((p) => !previous.has(p)).sort((a, b) => a - b);
+        const freed = [...previous].filter((p) => !now.has(p)).sort((a, b) => a - b);
+
+        clearScreen();
+        process.stdout.write(
+          '\n  ' +
+            paint(`👀 слежу за ${ports.length} порт(ами), ${scopeLabel}`, bold(), fg(C.accent)) +
+            paint(`   каждые ${intervalSec} с · Ctrl+C — выход`, fg(C.faint)) +
+            '\n' +
+            paint(`  наблюдаю с ${startedAt.toLocaleTimeString('ru-RU')} · обновлено ${clockNow()}\n`, fg(C.faint)),
+        );
+
+        if (currentBusy.length) {
+          process.stdout.write('\n' + renderTable(currentBusy) + '\n');
+        } else {
+          process.stdout.write('\n  ' + paint('все порты свободны', fg(C.ok)) + '\n');
+        }
+
+        if (!first && (appeared.length || freed.length)) {
+          process.stdout.write('\n  ' + paint('изменения', bold(), fg(C.accent)) + '\n');
+          for (const port of appeared) {
+            const hit = currentBusy.find((h) => h.port === port);
+            process.stdout.write(
+              '   ' +
+                paint(clockNow(), fg(C.faint)) +
+                paint('  + ', fg(C.err)) +
+                paint(`:${port}`, bold(), fg(C.err)) +
+                paint(`  ${hit && hit.rows.length ? shortProcess(hit.process) : 'заняли'}`, fg(C.text)) +
+                (hit?.pid ? paint(`  PID ${hit.pid}`, fg(C.faint)) : '') +
+                '\n',
+            );
+          }
+          for (const port of freed) {
+            process.stdout.write(
+              '   ' + paint(clockNow(), fg(C.faint)) + paint('  − ', fg(C.ok)) + paint(`:${port}`, bold(), fg(C.ok)) + paint('  освободился', fg(C.text)) + '\n',
+            );
+          }
+        } else if (!first) {
+          process.stdout.write(paint('\n  без изменений\n', fg(C.faint)));
+        }
+
+        previous = now;
+        first = false;
+        await sleep(intervalSec * 1000);
+      }
     }
 
     // Итог: таблица для короткого списка, сетка + таблица занятых для диапазона.

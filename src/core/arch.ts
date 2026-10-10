@@ -430,6 +430,17 @@ export function flattenFiles(node: ArchDir, out: ArchFile[] = []): ArchFile[] {
   return out;
 }
 
+/** Найти папку по относительному пути — для переходов по дереву. */
+export function findDir(node: ArchDir, rel: string): ArchDir | null {
+  if (!rel) return node;
+  for (const dir of node.dirs) {
+    if (dir.rel === rel) return dir;
+    const found = findDir(dir, rel);
+    if (found) return found;
+  }
+  return null;
+}
+
 /** Короткое человеческое описание файла — для панели деталей. */
 export function describeFile(file: ArchFile): string {
   const lower = file.name.toLowerCase();
@@ -444,3 +455,86 @@ export function describeFile(file: ArchFile): string {
   if (file.kind === 'code') return 'исходный код';
   return 'файл проекта';
 }
+
+/* --------------------------------- снимки --------------------------------- */
+
+export interface SnapshotFile {
+  rel: string;
+  lines: number | null;
+  bytes: number;
+}
+
+export interface ArchSnapshot {
+  at: string;
+  root: string;
+  projectType: string;
+  files: number;
+  dirs: number;
+  lines: number;
+  bytes: number;
+  entries: SnapshotFile[];
+}
+
+/** Снимок архитектуры — чтобы потом сравнить «было / стало». */
+export function snapshotOf(summary: ArchSummary, at = new Date().toISOString()): ArchSnapshot {
+  return {
+    at,
+    root: summary.root,
+    projectType: summary.projectType,
+    files: summary.files,
+    dirs: summary.dirs,
+    lines: summary.lines,
+    bytes: summary.bytes,
+    entries: flattenFiles(summary.tree)
+      .map((file) => ({ rel: file.rel, lines: file.lines, bytes: file.bytes }))
+      .sort((a, b) => a.rel.localeCompare(b.rel)),
+  };
+}
+
+export interface ChangedFile {
+  rel: string;
+  linesFrom: number | null;
+  linesTo: number | null;
+  bytesFrom: number;
+  bytesTo: number;
+}
+
+export interface ArchDiff {
+  added: SnapshotFile[];
+  removed: SnapshotFile[];
+  changed: ChangedFile[];
+  filesDelta: number;
+  linesDelta: number;
+  bytesDelta: number;
+  /** Снимок был сделан раньше — сравнивать честно. */
+  baseAt: string;
+}
+
+/** Сравнить два снимка: что появилось, что исчезло, что выросло. */
+export function diffSnapshots(previous: ArchSnapshot, current: ArchSnapshot): ArchDiff {
+  const before = new Map(previous.entries.map((e) => [e.rel, e]));
+  const after = new Map(current.entries.map((e) => [e.rel, e]));
+
+  const added = current.entries.filter((e) => !before.has(e.rel));
+  const removed = previous.entries.filter((e) => !after.has(e.rel));
+  const changed: ChangedFile[] = [];
+
+  for (const [rel, now] of after) {
+    const was = before.get(rel);
+    if (!was) continue;
+    if (was.lines !== now.lines || was.bytes !== now.bytes) {
+      changed.push({ rel, linesFrom: was.lines, linesTo: now.lines, bytesFrom: was.bytes, bytesTo: now.bytes });
+    }
+  }
+
+  return {
+    added,
+    removed,
+    changed: changed.sort((a, b) => Math.abs((b.linesTo ?? 0) - (b.linesFrom ?? 0)) - Math.abs((a.linesTo ?? 0) - (a.linesFrom ?? 0))),
+    filesDelta: current.files - previous.files,
+    linesDelta: current.lines - previous.lines,
+    bytesDelta: current.bytes - previous.bytes,
+    baseAt: previous.at,
+  };
+}
+

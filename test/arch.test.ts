@@ -258,6 +258,11 @@ test('scanTree не путает папку проекта с её именем'
 
 /* ------------------------------ вкладки и вёрстка ------------------------- */
 
+/** Сколько папок в поддереве, не считая корень. */
+function countDirs(node: ArchDir): number {
+  return node.dirs.reduce((sum, child) => sum + 1 + countDirs(child), 0);
+}
+
 test('buildTabs: вкладка на каждую папку, внутри — её папки и файлы', async () => {
   const { buildTabs } = await import('../src/commands/arch.ts');
   const dir = makeProject({
@@ -275,22 +280,36 @@ test('buildTabs: вкладка на каждую папку, внутри — �
     assert.equal(tabs[0].label.includes('Обзор'), true, 'первая вкладка — обзор');
     assert.equal(actions.length, tabs.length, 'у каждой вкладки свой список действий');
 
-    // Вкладки папок: ровно по одной на папку верхнего уровня плюс «В корне».
     const labels = tabs.map((t) => t.label);
+    assert.ok(labels.includes('🌳 Дерево'), 'есть вкладка со всем деревом');
+
+    // Вкладки папок: ровно по одной на папку верхнего уровня плюс «В корне».
     for (const child of summary.tree.dirs) {
       assert.ok(labels.includes(`📁 ${child.name}`), `нет вкладки для папки ${child.name}`);
     }
     assert.ok(labels.includes('📄 В корне'), 'файлы корня тоже видны');
 
-    // Внутри вкладки папки — именно её содержимое, и действия совпадают с пунктами.
+    // Внутри вкладки папки — всё её поддерево, а не только первый уровень:
+    // вложенные файлы идут со сдвигом вправо.
     const srcIndex = labels.indexOf('📁 src');
     const srcTab = tabs[srcIndex];
     const src = summary.tree.dirs.find((d) => d.name === 'src')!;
-    assert.equal(srcTab.items.length, src.dirs.length + src.files.length);
     const itemLabels = srcTab.items.map((i) => i.label);
-    for (const sub of src.dirs) assert.ok(itemLabels.includes(`📁 ${sub.name}/`), `нет пункта для ${sub.name}/`);
-    for (const file of src.files) assert.ok(itemLabels.some((l) => l.includes(file.name)), `нет пункта для ${file.name}`);
+
+    assert.ok(itemLabels.some((l) => l.includes('📁 core/')), 'видна вложенная папка');
+    assert.ok(itemLabels.some((l) => l.includes('📁 commands/')), 'и вторая вложенная папка');
+    assert.ok(itemLabels.some((l) => l.includes('util.ts')), 'файл внутри вложенной папки тоже виден');
     assert.equal(actions[srcIndex].length, srcTab.items.length);
+
+    const flatLabel = srcTab.items.find((i) => i.label.includes('index.ts'))!.label;
+    const deepLabel = srcTab.items.find((i) => i.label.includes('util.ts'))!.label;
+    assert.ok(deepLabel.length > flatLabel.length, 'вложенный файл сдвинут вправо');
+    assert.match(deepLabel, /^[│├└─\s]+/, 'у вложенной строки есть направляющие дерева');
+    assert.ok(flatLabel.includes('├─ ') || flatLabel.includes('└─ '), 'верхний уровень тоже нарисован ветками');
+
+    // Каждый пункт вкладки — отдельный узел дерева: папки и файлы считаются один раз.
+    const nodes = flattenFiles(src).length + countDirs(src);
+    assert.equal(srcTab.items.length, nodes, 'во вкладке ровно все узлы поддерева');
 
     // У каждого действия есть детали для панели справа.
     for (const tab of tabs) {

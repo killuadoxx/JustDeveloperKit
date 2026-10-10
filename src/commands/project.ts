@@ -16,6 +16,7 @@ import {
   ME_FILE,
   projectGroupLabel,
   runProjectCommand,
+  runProjectCommandWatched,
   writeMeFile,
   type MeCommand,
   type MeConfig,
@@ -25,7 +26,7 @@ import {
 import { openInEditor } from '../core/shell.ts';
 import { C, bold, fg, paint } from '../core/theme.ts';
 import { box, table, width } from '../core/ui.ts';
-import { stripBom } from '../core/util.ts';
+import { stripBom, formatMs } from '../core/util.ts';
 import type { Command } from '../core/registry.ts';
 
 /** Подобрать эмодзи по имени npm-скрипта — чтобы меню выглядело живым. */
@@ -342,11 +343,68 @@ const runCommand: Command = {
     }
 
     const runner = (entry: MeCommand) =>
-      runProjectCommand(entry, project, {
+      (entry.watch ? runProjectCommandWatched : runProjectCommand)(entry, project, {
         values: valuesFromFlags(entry, args.flags),
         askInputs: interactive ? askInputs : undefined,
         askConfirm,
       });
+
+    // jd run --all: прогнать все команды по порядку (линт → тесты → сборка).
+    if (flagBool(args, 'all')) {
+      const queue = list.filter((entry) => !entry.skipInAll);
+      const skipped = list.length - queue.length;
+      if (!queue.length) {
+        fail('Все команды помечены skipInAll — выполнять нечего.');
+        return;
+      }
+      process.stdout.write(
+        '\n  ' +
+          paint(`выполняю ${queue.length} команд(ы) по порядку`, bold(), fg(C.accent)) +
+          (skipped ? paint(`   пропускаю ${skipped} (skipInAll)`, fg(C.faint)) : '') +
+          '\n',
+      );
+
+      const results: { name: string; ok: boolean; ms: number }[] = [];
+      for (const entry of queue) {
+        const started = Date.now();
+        const ok = await runProjectCommand(entry, project, {
+          values: valuesFromFlags(entry, args.flags),
+          askInputs: interactive ? askInputs : undefined,
+          askConfirm,
+          showCommand: true,
+        });
+        results.push({ name: entry.name, ok, ms: Date.now() - started });
+        if (!ok && flagBool(args, 'fail-fast')) {
+          process.stdout.write(paint('  --fail-fast: останавливаюсь на первой ошибке\n', fg(C.warn)));
+          break;
+        }
+      }
+
+      const failed = results.filter((r) => !r.ok);
+      process.stdout.write(
+        '\n' +
+          table(
+            ['ИТОГ', 'КОМАНДА', 'ВРЕМЯ'],
+            results.map((r) => [
+              r.ok ? paint('✔', bold(), fg(C.ok)) : paint('✖', bold(), fg(C.err)),
+              paint(r.name, fg(r.ok ? C.text : C.err)),
+              paint(formatMs(r.ms), fg(C.faint)),
+            ]),
+          ) +
+          '\n',
+      );
+      process.stdout.write(
+        '\n  ' +
+          paint(`выполнено ${results.length} из ${queue.length}`, fg(C.muted)) +
+          paint('  ·  ', fg(C.faint)) +
+          (failed.length
+            ? paint(`упало ${failed.length}: ${failed.map((f) => f.name).join(', ')}`, fg(C.err))
+            : paint('всё зелёное', fg(C.ok))) +
+          '\n\n',
+      );
+      if (failed.length) process.exitCode = 1;
+      return;
+    }
 
     if (!query) {
       if (!interactive) {
@@ -413,9 +471,11 @@ function resolveEntry(project: ProjectContext, query: string): MeCommand | null 
 function renderList(project: ProjectContext): void {
   const list = project.config.commands;
   const hasInputs = list.some((c) => commandInputs(c).length);
+  const hasBadges = list.some((c) => commandBadges(c).length);
 
   const headers = ['№', 'КОМАНДА', 'ЗАПУСКАЕТ'];
   if (hasInputs) headers.push('ПАРАМЕТРЫ');
+  if (hasBadges) headers.push('ОСОБЕННОСТИ');
 
   const rows = list.map((entry, i) => {
     const row = [
@@ -426,6 +486,10 @@ function renderList(project: ProjectContext): void {
     if (hasInputs) {
       const specs = commandInputs(entry);
       row.push(specs.length ? paint(specs.map((s) => `{{${s.name}}}`).join(' '), fg(C.warn)) : paint('—', fg(C.faint)));
+    }
+    if (hasBadges) {
+      const badges = commandBadges(entry);
+      row.push(badges.length ? paint(badges.join(' · '), fg(C.accent)) : paint('—', fg(C.faint)));
     }
     return row;
   });
@@ -450,6 +514,7 @@ function renderList(project: ProjectContext): void {
       process.stdout.write('  ' + paint('⚑ ', fg(C.warn)) + paint(entry.name, fg(C.text)) + paint('  ' + commandBadges(entry).join(' · '), fg(C.faint)) + '\n');
     }
   }
+  process.stdout.write(paint('\n  прогнать всё по порядку: jd run --all   (--fail-fast — остановиться на первой ошибке)\n', fg(C.faint)));
   process.stdout.write('\n');
 }
 

@@ -11,23 +11,43 @@ import path from 'node:path';
 import { flagBool, flagNum, parseArgs } from '../core/args.ts';
 import {
   describeFile,
+  diffSnapshots,
   flattenFiles,
   KIND_ICON,
   KIND_LABEL,
   scanTree,
+  snapshotOf,
   type ArchDir,
   type ArchFile,
+  type ArchSnapshot,
   type ArchSummary,
   type FileKind,
 } from '../core/arch.ts';
 import { runDashboard, type DashItem, type DashTab } from '../core/dashboard.ts';
-import { fail, info } from '../core/help.ts';
+import { fail, info, ok } from '../core/help.ts';
 import { isInteractive, pause } from '../core/input.ts';
 import { neonBanner } from '../core/neon.ts';
 import { C, bold, fg, paint } from '../core/theme.ts';
+import { kv } from '../core/store.ts';
 import { bar, box, table, truncate } from '../core/ui.ts';
 import { countOf, formatBytes, num } from '../core/util.ts';
 import type { Command } from '../core/registry.ts';
+
+/** Ключ снимка архитектуры: свой для каждой папки проекта. */
+function snapshotKey(root: string): string {
+  return `arch_snapshot:${path.resolve(root).toLowerCase()}`;
+}
+
+function loadSnapshot(key: string): ArchSnapshot | null {
+  try {
+    const raw = kv.get(key, '');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ArchSnapshot;
+    return Array.isArray(parsed?.entries) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 const FILES_FORMS = ['файл', 'файла', 'файлов'] as const;
 const DIRS_FORMS = ['папка', 'папки', 'папок'] as const;
@@ -84,6 +104,51 @@ export function kindsTable(summary: ArchSummary): string {
 
 /* --------------------------------- дерево --------------------------------- */
 
+export interface TreeRow {
+  entry: ArchDir | ArchFile;
+  isDir: boolean;
+  /** Уровень вложенности: 0 — верхний. */
+  depth: number;
+  /** Направляющие линии: «│  ├─ ». */
+  prefix: string;
+}
+
+/**
+ * Разложить дерево в строки: одна запись — одна строка со своими направляющими.
+ * Этим пользуются и статичный вид, и вкладки: структура везде выглядит одинаково.
+ */
+export function treeRows(node: ArchDir, maxPerDir = Number.POSITIVE_INFINITY): TreeRow[] {
+  const rows: TreeRow[] = [];
+
+  const walk = (dir: ArchDir, prefix: string, depth: number): void => {
+    const entries: (ArchDir | ArchFile)[] = [...dir.dirs, ...dir.files];
+    const shown = entries.slice(0, maxPerDir);
+    shown.forEach((entry, index) => {
+      const last = index === shown.length - 1;
+      rows.push({
+        entry,
+        isDir: 'dirs' in entry,
+        depth,
+        prefix: prefix + (last ? '└─ ' : '├─ '),
+      });
+      if ('dirs' in entry) walk(entry, prefix + (last ? '   ' : '│  '), depth + 1);
+    });
+    if (entries.length > shown.length) {
+      const hidden = entries.length - shown.length;
+      rows.push({
+        // Псевдо-запись: показывает, что часть содержимого скрыта лимитом.
+        entry: { name: `… ещё ${hidden}`, rel: dir.rel, kind: 'other', bytes: 0, lines: null, depth: depth + 1 },
+        isDir: false,
+        depth,
+        prefix: prefix + '└─ ',
+      });
+    }
+  };
+
+  walk(node, '', 0);
+  return rows;
+}
+
 export interface TreeOptions {
   maxPerDir?: number;
   /** Показывать строки и размер у файлов. */
@@ -94,7 +159,6 @@ export interface TreeOptions {
 export function renderTree(node: ArchDir, opts: TreeOptions = {}): string[] {
   const maxPerDir = opts.maxPerDir ?? 14;
   const sizes = opts.sizes !== false;
-  const out: string[] = [];
 
   const label = (entry: ArchDir | ArchFile, isDir: boolean): string => {
     if (isDir) {
@@ -112,23 +176,7 @@ export function renderTree(node: ArchDir, opts: TreeOptions = {}): string[] {
     return paint(`${KIND_ICON[file.kind]} ${file.name}`, fg(C.soft)) + paint('   ' + bits.join(' · '), fg(C.faint));
   };
 
-  const walk = (dir: ArchDir, prefix: string): void => {
-    const entries: (ArchDir | ArchFile)[] = [...dir.dirs, ...dir.files];
-    const shown = entries.slice(0, maxPerDir);
-    shown.forEach((entry, index) => {
-      const last = index === shown.length - 1 && entries.length <= maxPerDir;
-      const branch = last ? '└─ ' : '├─ ';
-      const isDir = 'dirs' in entry;
-      out.push(paint(prefix + branch, fg(C.faint)) + label(entry, isDir));
-      if (isDir) walk(entry as ArchDir, prefix + (last ? '   ' : '│  '));
-    });
-    if (entries.length > shown.length) {
-      out.push(paint(prefix + '└─ ', fg(C.faint)) + paint(`… ещё ${entries.length - shown.length}`, fg(C.faint)));
-    }
-  };
-
-  walk(node, '');
-  return out;
+  return treeRows(node, maxPerDir).map((row) => paint(row.prefix, fg(C.faint)) + label(row.entry, row.isDir));
 }
 
 /* ------------------------------- статичный вид ---------------------------- */
@@ -210,6 +258,21 @@ function dirItem(dir: ArchDir): DashItem {
   };
 }
 
+/**
+ * Строка дерева как пункт меню: направляющие и отступы остаются,
+ * поэтому вложенность видно прямо в списке, а не только в деталях.
+ */
+function rowItem(row: TreeRow): DashItem {
+  const base = row.isDir ? dirItem(row.entry as ArchDir) : fileItem(row.entry as ArchFile);
+  const name = row.isDir ? `${(row.entry as ArchDir).name}/` : (row.entry as ArchFile).name;
+  const icon = row.isDir ? '📁' : KIND_ICON[(row.entry as ArchFile).kind];
+  return { ...base, label: `${row.prefix}${icon} ${name}` };
+}
+
+function rowAction(row: TreeRow): ArchAction {
+  return row.isDir ? { kind: 'dir', dir: row.entry as ArchDir } : { kind: 'file', file: row.entry as ArchFile };
+}
+
 export function buildTabs(summary: ArchSummary): { tabs: DashTab[]; actions: ArchAction[][] } {
   const tabs: DashTab[] = [];
   const actions: ArchAction[][] = [];
@@ -261,12 +324,16 @@ export function buildTabs(summary: ArchSummary): { tabs: DashTab[]; actions: Arc
   tabs.push({ label: `📊 Обзор`, items: overviewItems, accent: true });
   actions.push(overviewActions);
 
-  // По вкладке на каждую папку верхнего уровня: внутри — её папки и файлы.
+  // Всё дерево целиком: одна запись — одна строка со своими направляющими.
+  const allRows = treeRows(summary.tree);
+  tabs.push({ label: '🌳 Дерево', items: allRows.map(rowItem), accent: true });
+  actions.push(allRows.map(rowAction));
+
+  // И по вкладке на каждую папку верхнего уровня — чтобы можно было сосредоточиться.
   for (const dir of summary.tree.dirs) {
-    const items: DashItem[] = [...dir.dirs.map(dirItem), ...dir.files.map(fileItem)];
-    const acts: ArchAction[] = [...dir.dirs.map((d): ArchAction => ({ kind: 'dir', dir: d })), ...dir.files.map((f): ArchAction => ({ kind: 'file', file: f }))];
-    tabs.push({ label: `📁 ${dir.name}`, items, accent: true });
-    actions.push(acts);
+    const rows = treeRows(dir);
+    tabs.push({ label: `📁 ${dir.name}`, items: rows.map(rowItem), accent: true });
+    actions.push(rows.map(rowAction));
   }
 
   if (summary.tree.files.length) {
@@ -375,12 +442,13 @@ export default {
     'jd arch --tabs',
     'jd arch src --depth=2',
     'jd arch --json | jd json --query=byKind',
+    'jd arch --diff          (что изменилось с прошлого снимка)',
   ],
 
   async run({ argv, cwd }) {
     const args = parseArgs(
       argv,
-      { tabs: 'boolean', tree: 'boolean', depth: 'number', lines: 'boolean', json: 'boolean', all: 'boolean', per: 'number' },
+      { tabs: 'boolean', tree: 'boolean', depth: 'number', lines: 'boolean', json: 'boolean', all: 'boolean', per: 'number', diff: 'boolean', snapshot: 'boolean' },
     );
 
     const target = path.resolve(cwd, args._[0] ?? '.');
@@ -396,6 +464,77 @@ export default {
       return null;
     });
     if (!summary) return;
+
+    // Снимок: сохранить или сравнить с прошлым.
+    if (flagBool(args, 'snapshot') || flagBool(args, 'diff')) {
+      const current = snapshotOf(summary);
+      const key = snapshotKey(summary.root);
+      const previous = loadSnapshot(key);
+
+      if (flagBool(args, 'snapshot')) {
+        kv.set(key, JSON.stringify(current));
+        ok(`Снимок сохранён: ${countOf(current.files, ['файл', 'файла', 'файлов'])} · ${linesLabel(current.lines)}.`);
+        process.stdout.write(paint(`  сравнить потом: jd arch --diff\n\n`, fg(C.faint)));
+        return;
+      }
+
+      if (!previous) {
+        kv.set(key, JSON.stringify(current));
+        info('Снимка ещё не было — сохранил текущее состояние как точку отсчёта.');
+        process.stdout.write(paint('  теперь меняй код и смотри: jd arch --diff\n\n', fg(C.faint)));
+        return;
+      }
+
+      const diff = diffSnapshots(previous, current);
+      const delta = (value: number, unit: string, format: (n: number) => string = (n) => num(n)): string =>
+        (value > 0 ? paint(`+${format(value)}`, fg(C.ok)) : value < 0 ? paint(`−${format(-value)}`, fg(C.err)) : paint('0', fg(C.faint))) +
+        paint(` ${unit}`, fg(C.faint));
+
+      const body: string[] = [
+        paint(`снимок: ${new Date(previous.at).toLocaleString('ru-RU')}`, fg(C.faint)),
+        '',
+        paint('файлов  ', fg(C.muted)) + delta(diff.filesDelta, '') + paint(`   всего ${num(current.files)}`, fg(C.faint)),
+        paint('строк   ', fg(C.muted)) + delta(diff.linesDelta, '') + paint(`   всего ${num(current.lines)}`, fg(C.faint)),
+        paint('размер  ', fg(C.muted)) +
+          delta(diff.bytesDelta, '', (n) => formatBytes(n)) +
+          paint(`   всего ${formatBytes(current.bytes)}`, fg(C.faint)),
+      ];
+
+      if (diff.added.length) {
+        body.push('', paint(`НОВЫЕ ФАЙЛЫ (${diff.added.length})`, bold(), fg(C.ok)));
+        for (const file of diff.added.slice(0, 15)) body.push(paint(' + ', fg(C.ok)) + paint(file.rel, fg(C.text)) + paint(file.lines === null ? '' : `   ${linesLabel(file.lines)}`, fg(C.faint)));
+        if (diff.added.length > 15) body.push(paint(`   … ещё ${diff.added.length - 15}`, fg(C.faint)));
+      }
+      if (diff.removed.length) {
+        body.push('', paint(`УДАЛЁННЫЕ ФАЙЛЫ (${diff.removed.length})`, bold(), fg(C.err)));
+        for (const file of diff.removed.slice(0, 15)) body.push(paint(' − ', fg(C.err)) + paint(file.rel, fg(C.text)));
+        if (diff.removed.length > 15) body.push(paint(`   … ещё ${diff.removed.length - 15}`, fg(C.faint)));
+      }
+      if (diff.changed.length) {
+        body.push('', paint(`ИЗМЕНИЛИСЬ (${diff.changed.length})`, bold(), fg(C.warn)));
+        for (const file of diff.changed.slice(0, 15)) {
+          const linesChanged = (file.linesTo ?? 0) - (file.linesFrom ?? 0);
+          body.push(
+            paint(' ~ ', fg(C.warn)) +
+              paint(file.rel, fg(C.text)) +
+              paint(`   ${file.linesFrom ?? '—'} → ${file.linesTo ?? '—'}`, fg(C.faint)) +
+              (linesChanged ? paint(`  ${linesChanged > 0 ? '+' : '−'}${Math.abs(linesChanged)}`, fg(linesChanged > 0 ? C.ok : C.err)) : ''),
+          );
+        }
+        if (diff.changed.length > 15) body.push(paint(`   … ещё ${diff.changed.length - 15}`, fg(C.faint)));
+      }
+      if (!diff.added.length && !diff.removed.length && !diff.changed.length) {
+        body.push('', paint('✔', fg(C.ok)) + paint(' архитектура не изменилась с прошлого снимка', fg(C.text)));
+      }
+
+      if (flagBool(args, 'json')) {
+        process.stdout.write(JSON.stringify({ previous: previous.at, current: current.at, ...diff }, null, 2) + '\n');
+        return;
+      }
+      process.stdout.write('\n' + box(body, { title: paint(`🏗  Изменения в ${summary.name}`, bold(), fg(C.accent)) }) + '\n');
+      process.stdout.write(paint('  обновить снимок: jd arch --snapshot\n\n', fg(C.faint)));
+      return;
+    }
 
     if (flagBool(args, 'json')) {
       process.stdout.write(

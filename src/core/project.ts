@@ -45,6 +45,15 @@ export interface MeCommand {
   dependsOn?: string[];
   /** Параметры, которые подставляются в cmd вместо {{name}}. */
   inputs?: MeInput[];
+  /** Оборвать команду через N секунд. */
+  timeout?: number;
+  /**
+   * Следить за файлами и перезапускать: true — вся папка проекта,
+   * массив — конкретные папки и файлы относительно проекта.
+   */
+  watch?: boolean | string[];
+  /** Не запускать в `jd run --all` (например, dev-сервер). */
+  skipInAll?: boolean;
 }
 
 export interface MeConfig {
@@ -195,6 +204,26 @@ export function parseMe(raw: string, file: string): ProjectLoad {
         }
       }
 
+      if (entry.timeout !== undefined) {
+        const seconds = Number(entry.timeout);
+        if (Number.isFinite(seconds) && seconds > 0) parsed.timeout = Math.round(seconds);
+        else warnings.push(`${at}: timeout должен быть числом секунд больше нуля — проигнорирован`);
+      }
+
+      if (entry.watch !== undefined) {
+        if (entry.watch === true || entry.watch === false) parsed.watch = entry.watch;
+        else if (Array.isArray(entry.watch)) {
+          const paths = entry.watch.map(asString).filter(Boolean);
+          if (paths.length) parsed.watch = paths;
+          else warnings.push(`${at}: watch пустой массив — следить будет не за чем`);
+        } else warnings.push(`${at}: watch должен быть true или массивом путей`);
+      }
+
+      if (entry.skipInAll !== undefined) {
+        if (typeof entry.skipInAll === 'boolean') parsed.skipInAll = entry.skipInAll;
+        else warnings.push(`${at}: skipInAll должен быть true или false — проигнорирован`);
+      }
+
       if (entry.inputs !== undefined) {
         if (!Array.isArray(entry.inputs)) {
           warnings.push(`${at}: inputs должен быть массивом`);
@@ -342,6 +371,10 @@ export interface ExecHooks {
   /** Первый байт вывода — момент, когда пора убрать спиннер. */
   onFirstOutput?: () => void;
   onData?: (chunk: string) => void;
+  /** Оборвать команду через N секунд (из .me.json). */
+  timeoutSec?: number;
+  /** Команду пришлось прервать по таймауту. */
+  onTimeout?: (seconds: number) => void;
 }
 
 /**
@@ -392,9 +425,20 @@ export function execCommand(
     };
     process.once('SIGINT', forward);
 
+    // Таймаут из .me.json: команда-зависание не должна держать терминал вечно.
+    let timedOut = false;
+    const timer = hooks.timeoutSec
+      ? setTimeout(() => {
+          timedOut = true;
+          hooks.onTimeout?.(hooks.timeoutSec ?? 0);
+          if (child.pid) void killTree(child.pid);
+        }, hooks.timeoutSec * 1000)
+      : null;
+
     const done = (ok: boolean, code: number | null): void => {
       process.off('SIGINT', forward);
-      resolve({ ok, code, ms: Date.now() - started, output: buffer, interrupted });
+      if (timer) clearTimeout(timer);
+      resolve({ ok: ok && !timedOut, code, ms: Date.now() - started, output: buffer, interrupted });
     };
 
     child.on('error', (err) => {
@@ -511,6 +555,13 @@ export async function runProjectCommand(
   if (showCommand) lines.push(paint('  $ ', fg(C.faint)) + paint(finalCmd, fg(C.cyan)));
   if (entry.desc) lines.push(paint('  ' + entry.desc, fg(C.muted)));
   lines.push(paint('  в папке ', fg(C.faint)) + paint(cwd, fg(C.muted)));
+  if (entry.timeout) {
+    lines.push(paint('  таймаут ', fg(C.faint)) + paint(`${entry.timeout} с`, fg(C.warn)));
+  }
+  if (entry.watch) {
+    const what = entry.watch === true ? 'вся папка проекта' : entry.watch.join(', ');
+    lines.push(paint('  слежу за ', fg(C.faint)) + paint(what, fg(C.soft)) + paint(' — перезапуск при изменениях', fg(C.faint)));
+  }
   const shownEnv = { ...project.config.env, ...entry.env };
   if (Object.keys(shownEnv).length) {
     lines.push(
@@ -522,6 +573,7 @@ export async function runProjectCommand(
 
   const spin = neonSpinner(`выполняю: ${finalCmd}`);
   let announced = false;
+  let timedOut = false;
 
   const outcome = await execCommand(
     finalCmd,
@@ -533,6 +585,12 @@ export async function runProjectCommand(
         process.stdout.write(paint('  ── вывод команды ' + '─'.repeat(Math.max(4, 40)), fg(C.faint)) + '\n');
       },
       onData: (chunk) => process.stdout.write(chunk),
+      timeoutSec: entry.timeout,
+      onTimeout: (seconds) => {
+        timedOut = true;
+        spin.stop();
+        process.stdout.write(paint(`\n  ⏱ таймаут ${seconds} с — останавливаю команду\n`, fg(C.warn)));
+      },
     },
     env,
   );
@@ -548,6 +606,14 @@ export async function runProjectCommand(
   if (outcome.interrupted) {
     recordRun(project.dir, entry.name, finalCmd, false, outcome.ms);
     process.stdout.write('  ' + ch.hex(N.amber).bold('■') + ' ' + paint('прервано пользователем', fg(C.warn)) + '\n');
+    return false;
+  }
+  if (timedOut) {
+    recordRun(project.dir, entry.name, finalCmd, false, outcome.ms);
+    process.stdout.write(
+      '  ' + ch.hex(N.amber).bold('⏱') + ' ' + paint(`остановлено по таймауту ${entry.timeout} с`, fg(C.warn)) +
+        paint(`   ${time}`, fg(C.faint)) + '\n',
+    );
     return false;
   }
   if (outcome.ok) {
@@ -566,6 +632,60 @@ export async function runProjectCommand(
   return false;
 }
 
+/**
+ * Запустить команду проекта с наблюдением за файлами: команда выполняется,
+ * а затем перезапускается при каждом изменении до Ctrl+C.
+ */
+export async function runProjectCommandWatched(
+  entry: MeCommand,
+  project: ProjectContext,
+  opts: RunOptions = {},
+): Promise<boolean> {
+  const { compareStates, describeChange, fileState, isEmptyChange } = await import('./watch.ts');
+  const watched = entry.watch === true ? [project.dir] : (entry.watch ?? []).map((p) => path.resolve(project.dir, p));
+  if (!watched.length) return runProjectCommand(entry, project, opts);
+
+  const first = await runProjectCommand(entry, project, opts);
+  let states: Awaited<ReturnType<typeof fileState>>[] = [];
+  for (const target of watched) states.push(await fileState(target));
+
+  let stop = false;
+  process.once('SIGINT', () => {
+    stop = true;
+    process.stdout.write(paint('\n  наблюдение остановлено\n\n', fg(C.muted)));
+    process.exit(0);
+  });
+
+  process.stdout.write(
+    paint(`\n  слежу за ${watched.map((w) => path.relative(project.dir, w) || '.').join(', ')} — Ctrl+C останавливает\n`, fg(C.faint)),
+  );
+
+  while (!stop) {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    let changed = false;
+    const reasons: string[] = [];
+
+    for (let i = 0; i < watched.length; i++) {
+      const next = await fileState(watched[i]);
+      const diff = compareStates(states[i], next);
+      if (!isEmptyChange(diff)) {
+        changed = true;
+        reasons.push(describeChange(diff));
+      }
+      states[i] = next;
+    }
+
+    if (!changed) continue;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    for (let i = 0; i < watched.length; i++) states[i] = await fileState(watched[i]);
+
+    process.stdout.write(paint(`\n  ⟳ ${new Date().toLocaleTimeString('ru-RU')}  ${reasons.join(' · ')}\n`, fg(C.accent)));
+    await runProjectCommand(entry, project, { ...opts, showCommand: false, values: opts.values });
+  }
+
+  return first;
+}
+
 /** Заголовок блока проекта в меню и в списке команд. */
 export function projectGroupLabel(config: MeConfig): string {
   return `📂 Команды проекта [${config.projectName}]`;
@@ -579,6 +699,9 @@ export function commandBadges(entry: MeCommand): string[] {
   if (entry.confirm) badges.push('спрашивает подтверждение');
   if (entry.cwd) badges.push(`cwd: ${entry.cwd}`);
   if (entry.env) badges.push(`env: ${Object.keys(entry.env).join(', ')}`);
+  if (entry.timeout) badges.push(`таймаут: ${entry.timeout} с`);
+  if (entry.watch) badges.push(entry.watch === true ? 'перезапуск при изменениях' : `следит за: ${entry.watch.join(', ')}`);
+  if (entry.skipInAll) badges.push('пропускается в run --all');
   return badges;
 }
 
