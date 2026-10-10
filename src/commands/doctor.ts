@@ -6,6 +6,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
+import { parseArgs, flagBool } from '../core/args.ts';
+import { envDiff } from '../core/env.ts';
 import { ch, N, neonSpinner } from '../core/neon.ts';
 import { POPULAR_PORTS, scanPorts, shortProcess } from '../core/ports.ts';
 import { loadProject, ME_FILE, type ProjectLoad } from '../core/project.ts';
@@ -99,18 +101,47 @@ function readJson<T>(file: string): T | null {
 }
 
 /** Ключи из .env-файла: только имена, без значений — секреты нам не нужны. */
-function envKeys(file: string): string[] | null {
-  if (!existsSync(file)) return null;
-  try {
-    return stripBom(readFileSync(file, 'utf8'))
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('#') && line.includes('='))
-      .map((line) => line.slice(0, line.indexOf('=')).trim())
-      .filter(Boolean);
-  } catch {
-    return null;
+function checkEnvFiles(dir: string): Check {
+  const diff = envDiff(dir);
+  const list = (keys: string[], max = 6): string =>
+    `${keys.slice(0, max).join(', ')}${keys.length > max ? ` и ещё ${keys.length - max}` : ''}`;
+
+  if (!diff.hasExample && !diff.hasEnv) {
+    return { level: 'skip', what: 'Переменные окружения', detail: 'нет ни .env, ни .env.example' };
   }
+  if (!diff.hasEnv) {
+    return {
+      level: 'warn',
+      what: 'Переменные окружения',
+      detail: 'есть .env.example, но нет .env',
+      hint: 'Создать и заполнить: jd env --init',
+    };
+  }
+  if (!diff.hasExample) {
+    return {
+      level: 'ok',
+      what: 'Переменные окружения',
+      detail: `.env найден, ${diff.env.length} переменных`,
+      hint: 'Зафиксировать список для команды: jd env --example',
+    };
+  }
+  if (diff.missing.length) {
+    return {
+      level: 'warn',
+      what: 'Переменные окружения',
+      detail: `в .env не хватает: ${list(diff.missing)}`,
+      hint: 'Скорее всего приложение упадёт на старте — дописать: jd env --init',
+    };
+  }
+  if (diff.extra.length) {
+    return {
+      level: 'ok',
+      what: 'Переменные окружения',
+      detail: `.env покрывает .env.example и содержит ещё ${diff.extra.length}: ${list(diff.extra, 4)}`,
+      hint: diff.extra.length ? 'Добавить в пример: jd env --example' : undefined,
+    };
+  }
+  return { level: 'ok', what: 'Переменные окружения', detail: `.env и .env.example совпадают (${diff.env.length})` };
 }
 
 function checkNode(pkg: PackageJson | null): Check {
@@ -148,48 +179,6 @@ function checkProject(local: ProjectLoad): Check {
       : `разобран с замечаниями: ${local.project.warnings.join('; ')}`,
     hint: clean ? undefined : `Открой ${local.project.file} и поправь поля`,
   };
-}
-
-function checkEnvFiles(dir: string): Check {
-  const example = path.join(dir, '.env.example');
-  const env = path.join(dir, '.env');
-  const exampleKeys = envKeys(example);
-  const envKeysList = envKeys(env);
-
-  if (!exampleKeys && !envKeysList) {
-    return { level: 'skip', what: 'Переменные окружения', detail: 'нет ни .env, ни .env.example' };
-  }
-  if (!envKeysList) {
-    return {
-      level: 'warn',
-      what: 'Переменные окружения',
-      detail: 'есть .env.example, но нет .env',
-      hint: 'Скопируй: copy .env.example .env',
-    };
-  }
-  if (!exampleKeys) {
-    return { level: 'ok', what: 'Переменные окружения', detail: `.env найден, ${envKeysList.length} переменных` };
-  }
-
-  const missing = exampleKeys.filter((k) => !envKeysList.includes(k));
-  const extra = envKeysList.filter((k) => !exampleKeys.includes(k));
-
-  if (missing.length) {
-    return {
-      level: 'warn',
-      what: 'Переменные окружения',
-      detail: `в .env не хватает: ${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ` и ещё ${missing.length - 6}` : ''}`,
-      hint: 'Скорее всего приложение упадёт на старте из-за пустых переменных',
-    };
-  }
-  if (extra.length) {
-    return {
-      level: 'ok',
-      what: 'Переменные окружения',
-      detail: `.env покрывает .env.example и содержит ещё ${extra.length}: ${extra.slice(0, 4).join(', ')}`,
-    };
-  }
-  return { level: 'ok', what: 'Переменные окружения', detail: `.env и .env.example совпадают (${envKeysList.length})` };
 }
 
 async function checkDependencies(dir: string, pkg: PackageJson | null): Promise<Check> {
@@ -325,7 +314,8 @@ export default {
   usage: 'jd doctor',
   examples: ['jd doctor'],
 
-  async run({ cwd }) {
+  async run({ cwd, argv }) {
+    const args = parseArgs(argv, { json: 'boolean' });
     const dir = path.resolve(cwd);
     const pkg = readJson<PackageJson>(path.join(dir, 'package.json'));
     const local = await loadProject(dir);
@@ -350,6 +340,30 @@ export default {
     spin.stop();
 
     const busy = hits.filter((h) => h.open);
+
+    if (flagBool(args, 'json')) {
+      const errorsCount = checks.filter((c) => c.level === 'err').length;
+      const warnsCount = checks.filter((c) => c.level === 'warn').length;
+      process.stdout.write(
+        JSON.stringify(
+          {
+            dir,
+            project: pkg?.name ?? null,
+            node: process.version,
+            ok: errorsCount === 0 && warnsCount === 0,
+            errors: errorsCount,
+            warnings: warnsCount,
+            checks: checks.map((c) => ({ level: c.level, what: c.what, detail: c.detail, hint: c.hint ?? null })),
+            ports: { source, checked: portsToCheck.length, busy: busy.map((h) => ({ port: h.port, pid: h.pid ?? null, process: h.rows.length ? h.process : null })) },
+            hints: checks.filter((c) => c.hint && c.level !== 'ok' && c.level !== 'skip').map((c) => `${c.what}: ${c.hint}`),
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+      if (errorsCount) process.exitCode = 1;
+      return;
+    }
     checks.push(
       busy.length
         ? {

@@ -4,6 +4,7 @@
 import './core/warnings.ts';
 
 import { existsSync } from 'node:fs';
+import { expandAlias, tokenize } from './core/alias.ts';
 import { parseArgs } from './core/args.ts';
 import { runDashboard, type DashItem, type DashTab } from './core/dashboard.ts';
 import { fail, printCommandHelp, printHelp, suggest, VERSION } from './core/help.ts';
@@ -19,10 +20,13 @@ import {
   type ProjectContext,
 } from './core/project.ts';
 import { findCommand, groupsOf, loadCommands, type Command, type CommandContext } from './core/registry.ts';
+import { runStatOf } from './core/runs.ts';
+import { menuStatus, type MenuStatus } from './core/status.ts';
 import { dbPath, kv } from './core/store.ts';
 import { C, bold, fg, paint, setColor } from './core/theme.ts';
 import { applyTheme, DEFAULT_THEME, resolveStartupTheme } from './core/themes.ts';
 import { clearScreen } from './core/ui.ts';
+import { countOf, formatMs, timeAgo } from './core/util.ts';
 
 // Флаг цвета понимаем в любой позиции и вырезаем из аргументов, иначе он
 // уедет в разбор как имя команды ("Неизвестная команда --no-color").
@@ -122,6 +126,19 @@ function projectDetail(entry: MeCommand, project: ProjectContext): DashItem['det
   detail.push({ k: 'папка', v: commandCwd(entry, project) });
   if (project.config.projectName) detail.push({ k: 'проект', v: project.config.projectName });
 
+  // История запусков: видно, падало ли это раньше и сколько длится.
+  const stat = runStatOf(project.dir, entry.name);
+  if (stat) {
+    detail.push({
+      k: 'история',
+      v:
+        `${countOf(stat.runs, ['запуск', 'запуска', 'запусков'])}` +
+        (stat.fails ? ` · падений ${stat.fails}` : '') +
+        (stat.avgMs ? ` · в среднем ${formatMs(stat.avgMs)}` : '') +
+        `\nпоследний: ${timeAgo(stat.lastAt)} ${stat.lastOk ? '✔' : '✖'}`,
+    });
+  }
+
   for (const spec of commandInputs(entry)) {
     const bits = [`--${spec.name}`];
     if (spec.default !== undefined) bits.push(`по умолчанию "${spec.default}"`);
@@ -152,7 +169,7 @@ function globalDetail(cmd: Command): DashItem['detail'] {
 }
 
 /** Собрать вкладки интерфейса: сначала проект, затем глобальные разделы. */
-function buildTabs(local: Awaited<ReturnType<typeof loadProject>>): { tabs: DashTab[]; actions: MenuAction[][] } {
+function buildTabs(local: Awaited<ReturnType<typeof loadProject>>, status: MenuStatus | null): { tabs: DashTab[]; actions: MenuAction[][] } {
   const tabs: DashTab[] = [];
   const actions: MenuAction[][] = [];
 
@@ -199,6 +216,19 @@ function buildTabs(local: Awaited<ReturnType<typeof loadProject>>): { tabs: Dash
     actions.push(inGroup.map((cmd) => ({ kind: 'global' as const, cmd })));
   }
 
+  // Вкладка состояния — в конце: она справочная, команды важнее.
+  if (status && status.summary.length) {
+    tabs.push({
+      label: '📍 Сейчас',
+      items: status.summary.map((line) => ({
+        label: line,
+        hint: '',
+        detail: [{ v: line }, { v: status.attention ? 'Есть на что посмотреть — команды подскажут детали.' : 'Всё в порядке, можно работать.' }],
+      })),
+    });
+    actions.push(status.summary.map(() => ({ kind: 'info' as const, text: 'состояние проекта' })));
+  }
+
   return { tabs, actions };
 }
 
@@ -210,11 +240,14 @@ async function openMenu(): Promise<void> {
 
   for (;;) {
     const local = await loadProject(process.cwd());
-    const { tabs, actions } = buildTabs(local);
+    const projectPorts = local.status === 'ok' ? local.project.config.ports ?? [] : [];
+    // Состояние считаем молча и быстро: git, порты проекта, .env.
+    const status = await menuStatus({ dir: process.cwd(), ports: projectPorts }).catch(() => null);
+    const { tabs, actions } = buildTabs(local, status);
 
     const selection = await runDashboard(tabs, {
       title: 'jd · Just Developer Kit',
-      right: `v${VERSION}`,
+      right: `v${VERSION}${status ? ' · ' + status.right : ''}`,
     });
     if (!selection) {
       process.stdout.write(paint('  до связи 👋\n\n', fg(C.muted)));
@@ -269,7 +302,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const [first, ...rest] = rawArgv;
+  let [first, ...rest] = rawArgv;
 
   if (first === '--version' || first === '-v') {
     process.stdout.write(`jd ${VERSION}\n`);
@@ -280,7 +313,22 @@ async function main(): Promise<void> {
     return;
   }
 
-  const cmd = findCommand(ALL, first);
+  let cmd = findCommand(ALL, first);
+
+  // Алиасы проверяем только там, где команда не нашлась: как в git,
+  // настоящая команда всегда важнее псевдонима.
+  if (!cmd) {
+    const expanded = expandAlias(rawArgv);
+    if (expanded) {
+      process.stderr.write(
+        paint(`  · алиас: jd ${expanded.used.join(' → ')} = ${tokenize(expanded.argv.join(' ')).join(' ')}\n`, fg(C.faint)),
+      );
+      rawArgv = expanded.argv;
+      [first, ...rest] = rawArgv;
+      cmd = findCommand(ALL, first);
+    }
+  }
+
   if (!cmd) {
     const guesses = suggest(ALL, first);
     fail(

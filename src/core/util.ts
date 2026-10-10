@@ -73,6 +73,32 @@ export function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
 
+export type PluralForms = readonly [one: string, few: string, many: string];
+
+/**
+ * Русские формы множественного числа: 1 файл, 2 файла, 5 файлов.
+ * Нужны везде, где мы пишем «12 файлов» — иначе выходит «12 файл».
+ */
+export function plural(n: number, forms: PluralForms): string {
+  const abs = Math.abs(Math.round(n));
+  const mod100 = abs % 100;
+  const mod10 = abs % 10;
+  if (mod100 >= 11 && mod100 <= 14) return forms[2];
+  if (mod10 === 1) return forms[0];
+  if (mod10 >= 2 && mod10 <= 4) return forms[1];
+  return forms[2];
+}
+
+/** «12 файлов», «1 файл», «3 файла» — сразу с числом. */
+export function countOf(n: number, forms: PluralForms): string {
+  return `${n.toLocaleString('ru-RU')} ${plural(n, forms)}`;
+}
+
+/** Число с разделителями разрядов: 5382 → «5 382». */
+export function num(value: number): string {
+  return value.toLocaleString('ru-RU');
+}
+
 export function stamp(d = new Date()): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }

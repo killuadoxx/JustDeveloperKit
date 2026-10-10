@@ -71,7 +71,8 @@ export function db(): DB {
       payload    TEXT NOT NULL DEFAULT '',
       ok         INTEGER NOT NULL DEFAULT 1,
       ms         INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      context    TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS kv (
       key        TEXT PRIMARY KEY,
@@ -119,7 +120,18 @@ export function db(): DB {
     CREATE INDEX IF NOT EXISTS idx_history_kind ON history(kind, id DESC);
     CREATE INDEX IF NOT EXISTS idx_installs_project ON installs(project, id DESC);
   `);
+
+  // Старые базы создавались без context: добавляем колонку, а не ломаем их.
+  ensureColumn('history', 'context', "TEXT NOT NULL DEFAULT ''");
   return database;
+}
+
+/** Добавить колонку, если её ещё нет — мягкая миграция для уже существующих баз. */
+function ensureColumn(table: string, column: string, definition: string): void {
+  if (!database) return;
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (columns.some((c) => c.name === column)) return;
+  database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 function now(): string {
@@ -246,28 +258,43 @@ export interface HistoryRow {
   ok: number;
   ms: number;
   created_at: string;
+  context: string;
 }
 
 export const history = {
-  add(row: { kind: string; title: string; payload?: string; ok?: boolean; ms?: number }): void {
+  add(row: { kind: string; title: string; payload?: string; ok?: boolean; ms?: number; context?: string }): void {
     db()
-      .prepare('INSERT INTO history (kind, title, payload, ok, ms, created_at) VALUES (?,?,?,?,?,?)')
-      .run(row.kind, row.title, row.payload ?? '', row.ok === false ? 0 : 1, row.ms ?? 0, now());
+      .prepare('INSERT INTO history (kind, title, payload, ok, ms, created_at, context) VALUES (?,?,?,?,?,?,?)')
+      .run(row.kind, row.title, row.payload ?? '', row.ok === false ? 0 : 1, row.ms ?? 0, now(), row.context ?? '');
   },
   recent(kind: string, limit = 20): HistoryRow[] {
     return db()
       .prepare('SELECT * FROM history WHERE kind = ? ORDER BY id DESC LIMIT ?')
-      .all(kind, limit) as HistoryRow[];
+      .all(kind, limit) as unknown as HistoryRow[];
+  },
+  /** Всё по одному контексту (например, папке проекта), свежие сверху. */
+  byContext(kind: string, context: string, limit = 2000): HistoryRow[] {
+    return db()
+      .prepare('SELECT * FROM history WHERE kind = ? AND context = ? ORDER BY id DESC LIMIT ?')
+      .all(kind, context, limit) as unknown as HistoryRow[];
+  },
+  all(limit = 50): HistoryRow[] {
+    return db().prepare('SELECT * FROM history ORDER BY id DESC LIMIT ?').all(limit) as unknown as HistoryRow[];
   },
   search(query: string, limit = 20): HistoryRow[] {
     return db()
       .prepare('SELECT * FROM history WHERE title LIKE ? ORDER BY id DESC LIMIT ?')
-      .all(`%${query}%`, limit) as HistoryRow[];
+      .all(`%${query}%`, limit) as unknown as HistoryRow[];
   },
   clear(kind?: string): number {
     const res = kind
       ? db().prepare('DELETE FROM history WHERE kind = ?').run(kind)
       : db().prepare('DELETE FROM history').run();
+    return Number(res.changes);
+  },
+  /** Очистить историю одного контекста — например, конкретной папки проекта. */
+  clearContext(kind: string, context: string): number {
+    const res = db().prepare('DELETE FROM history WHERE kind = ? AND context = ?').run(kind, context);
     return Number(res.changes);
   },
 };

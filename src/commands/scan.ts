@@ -81,7 +81,7 @@ export default {
 
     const args = parseArgs(
       argv,
-      { ports: 'array', p: 'array', range: 'string', r: 'string', all: 'boolean', a: 'boolean', busy: 'boolean', b: 'boolean', yes: 'boolean', y: 'boolean', project: 'boolean' },
+      { ports: 'array', p: 'array', range: 'string', r: 'string', all: 'boolean', a: 'boolean', busy: 'boolean', b: 'boolean', yes: 'boolean', y: 'boolean', project: 'boolean', json: 'boolean' },
       { p: 'ports', r: 'range', a: 'all', b: 'busy', y: 'yes' },
     );
 
@@ -145,6 +145,29 @@ export default {
     const busy = hits.filter((h) => h.open);
     const elapsed = Date.now() - startsAt;
     const showAll = flagBool(args, 'all') && !flagBool(args, 'busy');
+
+    // Машинный вид: для алертов, вебхуков и скриптов.
+    if (flagBool(args, 'json')) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            scope: scopeLabel,
+            elapsedMs: elapsed,
+            checked: hits.length,
+            busy: busy.length,
+            ports: hits.map((hit) => ({
+              port: hit.port,
+              open: hit.open,
+              pid: hit.pid ?? null,
+              process: hit.rows.length ? hit.process : null,
+            })),
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+      return;
+    }
 
     // Итог: таблица для короткого списка, сетка + таблица занятых для диапазона.
     process.stdout.write('\n');

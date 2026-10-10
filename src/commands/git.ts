@@ -128,13 +128,13 @@ export default {
   group: 'Разработка',
   title: 'Репозитории',
   desc: 'Сводка по всем репам и отчёт о коммитах',
-  usage: 'jd git [status|log] [путь] [--days=7] [--depth=3]',
-  examples: ['jd git', 'jd git C:\\projects', 'jd git log --days=7', 'jd git status --depth=2'],
+  usage: 'jd git [status|log] [путь] [--days=7] [--depth=3] [--json]',
+  examples: ['jd git', 'jd git C:\\projects', 'jd git log --days=7', 'jd git status --depth=2', 'jd git --json'],
 
   async run({ argv, cwd }) {
     const args = parseArgs(
       argv,
-      { days: 'number', depth: 'number', root: 'string', all: 'boolean' },
+      { days: 'number', depth: 'number', root: 'string', all: 'boolean', json: 'boolean' },
     );
     const sub = ['log', 'status', 'report'].includes(args._[0] ?? '') ? args._[0] : 'status';
     const pathArg = args._[0] === sub ? args._[1] : args._[0];
@@ -211,6 +211,35 @@ export default {
     const spin = (await import('../core/ui.ts')).spinner(`читаю ${repos.length} репозиториев…`);
     const infos = await mapLimit(repos, 6, repoInfo);
     spin.stop();
+
+    if (flagBool(args, 'json')) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            root: path.resolve(root),
+            repos: infos.map((i) => ({
+              name: i.name,
+              dir: i.dir,
+              branch: i.branch,
+              dirty: i.dirty,
+              untracked: i.untracked,
+              ahead: i.ahead ?? null,
+              behind: i.behind ?? null,
+              lastCommit: i.lastSubject || null,
+              lastWhen: i.lastWhen || null,
+            })),
+            summary: {
+              total: infos.length,
+              changed: infos.filter((i) => i.dirty || i.untracked).length,
+              unpushed: infos.filter((i) => (i.ahead ?? 0) > 0).length,
+            },
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+      return;
+    }
 
     const dirty = infos.filter((i) => i.dirty || i.untracked).length;
     const sync = infos.filter((i) => (i.ahead ?? 0) > 0).length;

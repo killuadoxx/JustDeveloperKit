@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ch, N, neonSpinner } from './neon.ts';
+import { recordRun } from './runs.ts';
 import { killTree } from './shell.ts';
 import { C, bold, colorEnabledNow, fg, paint } from './theme.ts';
 import { box } from './ui.ts';
@@ -545,16 +546,19 @@ export async function runProjectCommand(
   const time = formatMs(outcome.ms);
   process.stdout.write('\n');
   if (outcome.interrupted) {
+    recordRun(project.dir, entry.name, finalCmd, false, outcome.ms);
     process.stdout.write('  ' + ch.hex(N.amber).bold('■') + ' ' + paint('прервано пользователем', fg(C.warn)) + '\n');
     return false;
   }
   if (outcome.ok) {
+    recordRun(project.dir, entry.name, finalCmd, true, outcome.ms);
     process.stdout.write(
       '  ' + ch.hex(N.lime).bold('✔') + ' ' + paint('команда завершилась успешно', fg(C.text)) +
         paint(`   код 0 · ${time}`, fg(C.faint)) + '\n',
     );
     return true;
   }
+  recordRun(project.dir, entry.name, finalCmd, false, outcome.ms);
   process.stdout.write(
     '  ' + ch.hex(N.red).bold('✖') + ' ' + paint('команда упала', fg(C.text)) +
       paint(`   код ${outcome.code ?? '—'} · ${time}`, fg(C.faint)) + '\n',
