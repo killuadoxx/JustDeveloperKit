@@ -1,0 +1,32 @@
+{
+  "name": "jd-cli",
+  "version": "0.3.0",
+  "private": true,
+  "description": "jd — Just Developer Kit. Личный CLI для повседневной работы: система, данные, сеть, git и команды проекта.",
+  "type": "module",
+  "bin": {
+    "jd": "./src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "jd": "node src/cli.ts",
+    "menu": "node src/cli.ts menu",
+    "list": "node src/cli.ts list",
+    "help": "node src/cli.ts help"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2"
+  },
+  "keywords": [
+    "cli",
+    "terminal",
+    "tui",
+    "developer-tools",
+    "port-scanner",
+    "git-automation"
+  ],
+  "author": "",
+  "license": "MIT"
+}

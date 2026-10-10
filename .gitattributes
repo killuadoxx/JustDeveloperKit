@@ -1,0 +1,14 @@
+# Храним исходники с LF: иначе после clone на машине с core.autocrlf=true
+# каждый файл покажется изменённым.
+* text=auto eol=lf
+
+# Windows-скрипты должны остаться с CRLF — так надёжнее для cmd.exe.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Бинарное не трогаем.
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
