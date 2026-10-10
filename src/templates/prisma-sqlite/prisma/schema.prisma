@@ -1,0 +1,33 @@
+// Схема Prisma для SQLite.
+// Это шаблон для пресета "prisma-sqlite" — при установке файл копируется в проект.
+//
+// Дальше: npx prisma db push (создать таблицы) → npx prisma studio (посмотреть данные).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  posts     Post[]
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String
+  body      String?
+  published Boolean  @default(false)
+  createdAt DateTime @default(now())
+  authorId  Int
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([authorId])
+}

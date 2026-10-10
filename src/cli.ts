@@ -3,6 +3,7 @@
 
 import './core/warnings.ts';
 
+import { existsSync } from 'node:fs';
 import { parseArgs } from './core/args.ts';
 import { runDashboard, type DashItem, type DashTab } from './core/dashboard.ts';
 import { fail, printCommandHelp, printHelp, suggest, VERSION } from './core/help.ts';
@@ -18,7 +19,9 @@ import {
   type ProjectContext,
 } from './core/project.ts';
 import { findCommand, groupsOf, loadCommands, type Command, type CommandContext } from './core/registry.ts';
+import { dbPath, kv } from './core/store.ts';
 import { C, bold, fg, paint, setColor } from './core/theme.ts';
+import { applyTheme, DEFAULT_THEME, resolveStartupTheme } from './core/themes.ts';
 import { clearScreen } from './core/ui.ts';
 
 // Флаг цвета понимаем в любой позиции и вырезаем из аргументов, иначе он
@@ -27,6 +30,18 @@ let rawArgv = process.argv.slice(2);
 if (rawArgv.includes('--no-color')) setColor(false);
 else if (rawArgv.includes('--color')) setColor(true);
 rawArgv = rawArgv.filter((a) => a !== '--no-color' && a !== '--color');
+
+// Тема применяется до первой отрисовки. Базу не создаём на пустом месте:
+// у команд вроде `jd json` не должно появляться ~/.jd только из-за темы.
+{
+  const saved = existsSync(dbPath()) ? kv.get('theme', DEFAULT_THEME) : DEFAULT_THEME;
+  applyTheme(resolveStartupTheme(saved));
+}
+
+// Пайп закрылся раньше нас ("jd list | head") — это норма, а не ошибка.
+process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') process.exit(0);
+});
 
 let ALL: Command[] = [];
 

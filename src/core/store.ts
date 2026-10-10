@@ -3,10 +3,10 @@
 
 import './warnings.ts';
 
-import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 
 export function jdHome(): string {
   return process.env.JD_HOME || path.join(os.homedir(), '.jd');
@@ -16,12 +16,29 @@ export function dbPath(): string {
   return path.join(jdHome(), 'jd.db');
 }
 
-let database: DatabaseSync | null = null;
+type DB = DatabaseSync;
 
-export function db(): DatabaseSync {
+let ctor: (new (file: string) => DB) | null = null;
+let database: DB | null = null;
+
+/**
+ * node:sqlite подгружаем лениво — и ради скорости (командам без базы он не нужен),
+ * и ради тишины: при статическом импорте Node печатает ExperimentalWarning
+ * на этапе загрузки графа, то есть раньше, чем warnings.ts успевает заглушить его.
+ */
+function databaseClass(): new (file: string) => DB {
+  if (!ctor) {
+    const mod = process.getBuiltinModule('node:sqlite') as { DatabaseSync: new (file: string) => DB };
+    ctor = mod.DatabaseSync;
+  }
+  return ctor;
+}
+
+export function db(): DB {
   if (database) return database;
   mkdirSync(jdHome(), { recursive: true });
-  database = new DatabaseSync(dbPath());
+  const Database = databaseClass();
+  database = new Database(dbPath());
   database.exec('PRAGMA journal_mode = WAL');
   database.exec(`
     CREATE TABLE IF NOT EXISTS snippets (
@@ -60,7 +77,47 @@ export function db(): DatabaseSync {
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL
     );
+    -- Магазин расширений: базовый каталог плюс всё, что пользователь добавил сам.
+    CREATE TABLE IF NOT EXISTS pkgs (
+      name       TEXT PRIMARY KEY,
+      spec       TEXT NOT NULL,
+      title      TEXT NOT NULL DEFAULT '',
+      desc       TEXT NOT NULL DEFAULT '',
+      category   TEXT NOT NULL DEFAULT 'Разное',
+      tags       TEXT NOT NULL DEFAULT '',
+      url        TEXT NOT NULL DEFAULT '',
+      dev        INTEGER NOT NULL DEFAULT 0,
+      builtin    INTEGER NOT NULL DEFAULT 0,
+      hidden     INTEGER NOT NULL DEFAULT 0,
+      installs   INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS presets (
+      name       TEXT PRIMARY KEY,
+      title      TEXT NOT NULL DEFAULT '',
+      desc       TEXT NOT NULL DEFAULT '',
+      icon       TEXT NOT NULL DEFAULT '📦',
+      items      TEXT NOT NULL DEFAULT '[]',
+      scripts    TEXT NOT NULL DEFAULT '{}',
+      env        TEXT NOT NULL DEFAULT '[]',
+      files      TEXT NOT NULL DEFAULT '[]',
+      builtin    INTEGER NOT NULL DEFAULT 0,
+      uses       INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS installs (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      project    TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      spec       TEXT NOT NULL,
+      dev        INTEGER NOT NULL DEFAULT 0,
+      ok         INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_history_kind ON history(kind, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_installs_project ON installs(project, id DESC);
   `);
   return database;
 }

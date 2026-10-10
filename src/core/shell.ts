@@ -51,6 +51,19 @@ export function run(cmd: string, args: string[] = [], opts: RunOptions = {}): Pr
   });
 }
 
+/**
+ * Запустить команду как в терминале: npm, pnpm, yarn и bun на Windows — это
+ * .cmd-обёртки, которые execFile не умеет запускать напрямую. Передаём строку
+ * оболочке сами: опция shell у execFile в Node 24 помечена устаревшей при
+ * передаче массива аргументов.
+ */
+export function runLine(commandLine: string, opts: RunOptions = {}): Promise<RunResult> {
+  if (process.platform === 'win32') {
+    return run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], opts);
+  }
+  return run('/bin/sh', ['-c', commandLine], opts);
+}
+
 let psExe: string | null = null;
 
 /** PowerShell 7, если есть, иначе встроенный powershell.exe. */

@@ -92,7 +92,7 @@ export function findCommand(commands: Command[], name: string): Command | undefi
 }
 
 export function groupsOf(commands: Command[]): string[] {
-  const order = ['Система', 'Разработка', 'Данные', 'Сеть', 'Файлы', 'Заметки', 'Разное'];
+  const order = ['Система', 'Разработка', 'Магазин', 'Данные', 'Сеть', 'Файлы', 'Заметки', 'Разное'];
   const present = [...new Set(commands.filter((c) => !c.hidden).map((c) => c.group))];
   return present.sort((a, b) => {
     const ia = order.indexOf(a);

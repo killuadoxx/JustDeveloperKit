@@ -193,6 +193,186 @@ export async function selectList(items: SelectItem[], opts: SelectOptions = {}):
   });
 }
 
+/**
+ * Выбор нескольких пунктов: Space — отметить, Enter — принять.
+ * Возвращает индексы в исходном массиве (по возрастанию) или null, если отменили.
+ */
+export async function multiSelect(
+  items: SelectItem[],
+  opts: SelectOptions & { preselected?: number[] } = {},
+): Promise<number[] | null> {
+  if (!isInteractive()) {
+    throw new Error('Это интерактивная команда — запусти её в обычном окне терминала.');
+  }
+  if (items.length === 0) return [];
+
+  const rows = process.stdout.rows ?? 30;
+  const pageSize = Math.max(5, Math.min(opts.pageSize ?? 16, rows - 10));
+
+  const stdin = process.stdin;
+  const frame = new Frame();
+  const marked = new Set<number>(opts.preselected ?? []);
+  let query = '';
+  let cursor = 0;
+
+  readline.emitKeypressEvents(stdin);
+  const wasRaw = stdin.isRaw;
+  stdin.setRawMode(true);
+  stdin.resume();
+  hideCursor();
+
+  type ViewRow = { item: SelectItem; index: number; positions: number[] };
+  const computeView = (): ViewRow[] => {
+    if (!query) return items.map((item, index) => ({ item, index, positions: [] }));
+    return items
+      .map((item, index) => {
+        const m = fuzzyMatch(query, `${item.label} ${item.hint ?? ''} ${item.group ?? ''}`);
+        return m ? { item, index, positions: m.positions, score: m.score } : null;
+      })
+      .filter((x): x is ViewRow & { score: number } => x !== null)
+      .sort((a, b) => b.score - a.score)
+      .map(({ item, index, positions }) => ({ item, index, positions }));
+  };
+
+  let view = computeView();
+
+  const renderRows = (): string[] => {
+    if (view.length === 0) return [paint('  ничего не найдено', fg(C.warn))];
+    const win = Math.min(pageSize, view.length);
+    let top = 0;
+    if (cursor >= pageSize) top = cursor - pageSize + 1;
+    if (top + win > view.length) top = Math.max(0, view.length - win);
+
+    const out: string[] = [];
+    let lastGroup = '';
+    const totalWidth = Math.max(30, (process.stdout.columns ?? 90) - 4);
+
+    for (let i = top; i < top + win; i++) {
+      const row = view[i];
+      const group = row.item.group ?? '';
+      if (group && group !== lastGroup && !query) {
+        if (out.length) out.push('');
+        const emphasized = opts.emphasizeGroups?.includes(group) ?? false;
+        out.push(paint('  ' + group, ...(emphasized ? [bold(), fg(C.accent)] : [fg(C.muted)])));
+        lastGroup = group;
+      }
+      const selected = i === cursor;
+      const on = marked.has(row.index);
+      const box = on ? paint('[×]', bold(), fg(C.ok)) : paint('[ ]', fg(C.faint));
+      const marker = selected ? paint('❯', fg(C.accent), bold()) : ' ';
+      const label = on
+        ? paint(row.item.label, bold(), fg(C.text))
+        : selected
+          ? paint(row.item.label, fg(C.text))
+          : paint(row.item.label, fg(C.soft));
+      const hint = row.item.hint ? paint(row.item.hint, fg(C.faint)) : '';
+      const gap = Math.max(1, totalWidth - width(row.item.label) - width(row.item.hint ?? '') - 9);
+      out.push(truncate(`${marker} ${box} ${label}` + ' '.repeat(gap) + hint, totalWidth));
+    }
+
+    if (view.length > win) out.push(paint(`  … ещё ${view.length - win}`, fg(C.faint)));
+    return out;
+  };
+
+  const render = (): void => {
+    const lines: string[] = [];
+    if (opts.title) lines.push(paint(opts.title, bold(), fg(C.primary)));
+    lines.push(
+      paint('  › ', fg(C.accent)) +
+        (query ? paint(query, fg(C.text)) : paint('печатай для поиска', fg(C.faint))),
+    );
+    lines.push(paint(`  отмечено: ${marked.size}`, fg(marked.size ? C.ok : C.faint)));
+    if (opts.subtitle) lines.push(paint('  ' + opts.subtitle, fg(C.muted)));
+    lines.push('');
+    lines.push(...renderRows());
+    lines.push('');
+    lines.push(paint('  ↑↓ выбор · Space отметить · Enter принять · Esc отмена', fg(C.faint)));
+    frame.draw(lines);
+  };
+
+  return new Promise<number[] | null>((resolve) => {
+    const cleanup = (): void => {
+      stdin.removeListener('keypress', onKey);
+      stdin.setRawMode(wasRaw ?? false);
+      stdin.pause();
+      showCursor();
+      frame.done();
+    };
+
+    const finish = (result: number[] | null): void => {
+      cleanup();
+      if (result === null) process.stdout.write(paint('  отменено', fg(C.muted)) + '\n');
+      else process.stdout.write(paint(`  ✓ отмечено: ${result.length}`, fg(C.ok)) + '\n');
+      resolve(result);
+    };
+
+    const onKey = (_str: string, key: readline.Key): void => {
+      if (!key) return;
+      if (key.ctrl && key.name === 'c') return finish(null);
+
+      switch (key.name) {
+        case 'escape':
+          return finish(null);
+        case 'return':
+        case 'enter':
+          return finish([...marked].sort((a, b) => a - b));
+        case 'space': {
+          const row = view[cursor];
+          if (row) {
+            if (marked.has(row.index)) marked.delete(row.index);
+            else marked.add(row.index);
+          }
+          render();
+          return;
+        }
+        case 'up':
+        case 'k':
+          if (key.name === 'up' || query === '') cursor = Math.max(0, cursor - 1);
+          render();
+          return;
+        case 'down':
+        case 'j':
+          if (key.name === 'down' || query === '') cursor = Math.min(view.length - 1, cursor + 1);
+          render();
+          return;
+        case 'pageup':
+          cursor = Math.max(0, cursor - pageSize);
+          render();
+          return;
+        case 'pagedown':
+          cursor = Math.min(view.length - 1, cursor + pageSize);
+          render();
+          return;
+        case 'home':
+          cursor = 0;
+          render();
+          return;
+        case 'end':
+          cursor = Math.max(0, view.length - 1);
+          render();
+          return;
+        case 'backspace':
+        case 'delete':
+          query = query.slice(0, -1);
+          break;
+        default: {
+          const seq = key.sequence ?? '';
+          if (key.ctrl || key.meta || seq.length === 0) return;
+          if ([...seq].length !== 1) return;
+          query += seq;
+        }
+      }
+
+      view = computeView();
+      cursor = 0;
+      render();
+    };
+
+    stdin.on('keypress', onKey);
+    render();
+  });
+}
+
 export async function promptText(question: string, def = ''): Promise<string> {
   if (!isInteractive()) return def;
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

@@ -164,6 +164,13 @@ export function parseMe(raw: string, file: string): ProjectLoad {
 
       const parsed: MeCommand = { name, cmd };
 
+      // Имена команд — ключ меню: два одинаковых пункта только путают,
+      // а `jd run <имя>` всё равно возьмёт первый.
+      if (commands.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+        warnings.push(`${at} «${name}» пропущена: команда с таким именем уже есть`);
+        return;
+      }
+
       const desc = asString(entry.desc);
       if (desc) parsed.desc = desc;
 
